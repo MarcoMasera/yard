@@ -6,16 +6,19 @@ from datetime import datetime, timezone
 
 from confluent_kafka import Producer
 
-
+# Kafka topic and broker (exposed by docker-compose)
 TOPIC_NAME = "iot-events"
-BOOTSTRAP_SERVERS = "localhost:29092"  # come esposto nel docker-compose
+BOOTSTRAP_SERVERS = "localhost:29092"
 
-
+# Simple catalog of devices / types used to generate sample data
 DEVICE_TYPES = ["sensor_temp", "sensor_humidity", "sensor_motion"]
-DEVICE_IDS = [f"dev-{i:03d}" for i in range(1, 51)]  # 50 device
+DEVICE_IDS = [f"dev-{i:03d}" for i in range(1, 51)]  # 50 devices
 
 
 def build_event() -> dict:
+    """
+    Build a single IoT-like event, matching the schema expected by Spark.
+    """
     now = datetime.now(timezone.utc)
 
     device_id = random.choice(DEVICE_IDS)
@@ -34,17 +37,23 @@ def build_event() -> dict:
     }
 
 
-def delivery_report(err, msg):
-    """Callback chiamata ad ogni messaggio consegnato o fallito."""
+def delivery_report(err, msg) -> None:
+    """
+    Called for each message to report delivery result.
+    Only errors are logged.
+    """
     if err is not None:
         print(f"Delivery failed for record {msg.key()}: {err}")
-    # se vuoi, puoi loggare i successi, ma in genere non serve per ogni msg
 
 
-def main():
+def main() -> None:
+    """
+    Create an idempotent Kafka producer and send events in a loop.
+    """
     conf = {
         "bootstrap.servers": BOOTSTRAP_SERVERS,
-        "enable.idempotence": True,   # aiuta per semantica at-least-once / near exactly-once
+        # Safer delivery guarantees (at-least-once / near exactly-once)
+        "enable.idempotence": True,
         "acks": "all",
         "retries": 5,
         "linger.ms": 10,
@@ -56,13 +65,16 @@ def main():
     try:
         while True:
             event = build_event()
+
             producer.produce(
                 TOPIC_NAME,
                 value=json.dumps(event).encode("utf-8"),
                 on_delivery=delivery_report,
             )
-            # flush parziale per svuotare il buffer ogni tanto
+
+            # Serve delivery callbacks and flush internal buffer gradually
             producer.poll(0)
+
             print(f"Sent: {event}")
             time.sleep(0.2)
     except KeyboardInterrupt:

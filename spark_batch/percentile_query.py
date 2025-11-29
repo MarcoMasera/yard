@@ -1,18 +1,22 @@
 import os
+
 from pyspark.sql import SparkSession, functions as F
 
-
-# Config MinIO (stessa usata nello streaming)
+# MinIO config (aligned with streaming job)
 MINIO_ENDPOINT = os.getenv("MINIO_ENDPOINT", "http://localhost:9000")
 MINIO_ACCESS_KEY = os.getenv("MINIO_ACCESS_KEY", "admin")
 MINIO_SECRET_KEY = os.getenv("MINIO_SECRET_KEY", "admin12345")
 MINIO_BUCKET = os.getenv("MINIO_BUCKET", "streaming-output")
 
+# Raw input written by the streaming job and output path for the analytics
 RAW_INPUT_PATH = f"s3a://{MINIO_BUCKET}/raw_events"
 RESULT_OUTPUT_PATH = f"s3a://{MINIO_BUCKET}/analytics/p95_event_duration"
 
 
-def get_spark():
+def get_spark() -> SparkSession:
+    """
+    Create SparkSession configured to read from MinIO via S3A.
+    """
     packages = "org.apache.hadoop:hadoop-aws:3.3.4"
 
     spark = (
@@ -22,6 +26,7 @@ def get_spark():
         .getOrCreate()
     )
 
+    # S3A connector setup for MinIO
     hconf = spark._jsc.hadoopConfiguration()
     hconf.set("fs.s3a.endpoint", MINIO_ENDPOINT)
     hconf.set("fs.s3a.access.key", MINIO_ACCESS_KEY)
@@ -36,24 +41,34 @@ def get_spark():
     return spark
 
 
-def main():
+def main() -> None:
+    """
+    Batch job: compute daily 95th percentile of event_duration per device_type.
+
+    Steps:
+    - read raw events from MinIO
+    - derive event_date
+    - compute daily stats and remove outliers (> 3 std devs)
+    - compute 95th percentile
+    - keep only device types with >= 500 distinct events / day
+    - write result as CSV
+    """
     spark = get_spark()
 
     print(f"Reading raw events from: {RAW_INPUT_PATH}")
     events = spark.read.parquet(RAW_INPUT_PATH)
 
-    # ci assicuriamo di avere un timestamp e una data
+    # Ensure we have timestamp + date columns
     if "event_time" in events.columns:
         df = events.withColumn("event_date", F.to_date("event_time"))
     else:
-        # fallback se per qualche motivo avessimo solo event_timestamp string
         df = (
             events
             .withColumn("event_time", F.to_timestamp("event_timestamp"))
             .withColumn("event_date", F.to_date("event_time"))
         )
 
-    # filtriamo eventuali null / valori strani
+    # Basic data quality filters
     df = (
         df
         .filter(F.col("event_duration").isNotNull())
@@ -61,45 +76,49 @@ def main():
         .filter(F.col("event_date").isNotNull())
     )
 
-    # 1) statistiche base per device_type, day
+    # 1) Daily stats per (device_type, event_date)
     stats = (
         df.groupBy("device_type", "event_date")
           .agg(
               F.avg("event_duration").alias("mean_duration"),
               F.stddev_samp("event_duration").alias("std_duration"),
-              F.countDistinct("event_id").alias("events_per_day")
+              F.countDistinct("event_id").alias("events_per_day"),
           )
     )
 
-    # 2) join con gli eventi per calcolare gli outlier
+    # 2) Join stats back to events to compute outliers
     df_with_stats = df.join(
         stats,
         on=["device_type", "event_date"],
-        how="inner"
+        how="inner",
     )
 
-    # 3) rimuovi outlier oltre 3 deviazioni standard dalla media giornaliera
+    # 3) Remove outliers beyond 3 * stddev from the daily mean
     filtered = df_with_stats.filter(
-        (F.col("std_duration").isNotNull()) &
-        (F.abs(F.col("event_duration") - F.col("mean_duration")) <= 3 * F.col("std_duration"))
+        (F.col("std_duration").isNotNull())
+        & (
+            F.abs(F.col("event_duration") - F.col("mean_duration"))
+            <= 3 * F.col("std_duration")
+        )
     )
 
-    # 4) calcola il 95° percentile di event_duration per device_type e giorno
+    # 4) Compute 95th percentile per (device_type, event_date)
     percentiles = (
         filtered.groupBy("device_type", "event_date")
-                .agg(
-                    F.expr("percentile_approx(event_duration, 0.95)").alias("p95_event_duration"),
-                    F.countDistinct("event_id").alias("events_after_filter")
-                )
+        .agg(
+            F.expr("percentile_approx(event_duration, 0.95)").alias(
+                "p95_event_duration"
+            ),
+            F.countDistinct("event_id").alias("events_after_filter"),
+        )
     )
 
-
-    # 5) tieni solo i device_type con almeno 500 eventi distinti al giorno (sul totale, non solo filtrati)
+    # 5) Keep only device types with >= 500 distinct events/day (before filtering)
     result = (
         percentiles.join(
             stats.select("device_type", "event_date", "events_per_day"),
             on=["device_type", "event_date"],
-            how="inner"
+            how="inner",
         )
         .filter(F.col("events_per_day") >= 500)
         .select(
@@ -107,7 +126,7 @@ def main():
             "device_type",
             "p95_event_duration",
             "events_per_day",
-            "events_after_filter"
+            "events_after_filter",
         )
         .orderBy("event_date", "device_type")
     )
@@ -117,14 +136,13 @@ def main():
     print("Sample result rows:")
     result.show(50, truncate=False)
 
-    # 6) scrivi il risultato in CSV (file di validazione richiesto dal test)
+    # 6) Persist result as a single CSV (validation artifact)
     print(f"Writing results to: {RESULT_OUTPUT_PATH}")
     (
-        result.coalesce(1)  # comodo per avere pochi file CSV
-              .write
-              .mode("overwrite")
-              .option("header", "true")
-              .csv(RESULT_OUTPUT_PATH)
+        result.coalesce(1)
+        .write.mode("overwrite")
+        .option("header", "true")
+        .csv(RESULT_OUTPUT_PATH)
     )
 
 

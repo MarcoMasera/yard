@@ -474,3 +474,31 @@ Typical order to run the whole pipeline:
 7. Stop producer and streaming job with `Ctrl + C`, then stop Docker services with `docker compose down`.
 
 This completes the requested streaming ETL pipeline, S3-compatible storage integration, and analytic Spark query.
+
+
+## 13. Monitoring (Optional)
+
+For this take-home I focused mainly on the data pipeline, but I also added a minimal
+monitoring stack based on **Prometheus** and **Grafana**, located under `monitoring/`.
+
+### 13.1 Components
+
+- `monitoring/docker-compose.yml`
+  - starts Prometheus and Grafana
+- `monitoring/prometheus.yml`
+  - basic Prometheus configuration with two scrape jobs:
+    - `spark`  – intended to scrape Spark driver metrics on `host.docker.internal:4040`
+    - `kafka-ui` – simple HTTP check against Kafka UI on `host.docker.internal:8080`
+
+In a production environment I would expose proper Prometheus metrics from Spark and Kafka
+via JMX exporters or native Prometheus endpoints. For this exercise the configuration is
+kept intentionally simple and mainly illustrates how the stack would be wired together.
+
+### 13.2 How to run
+
+From the project root:
+
+```bash
+cd monitoring
+docker compose up -d
+docker compose ps

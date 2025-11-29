@@ -1,0 +1,16 @@
+global:
+  scrape_interval: 10s
+
+scrape_configs:
+  # Spark driver metrics (via JMX/metrics bridge or Prometheus endpoint)
+  - job_name: "spark"
+    metrics_path: /metrics
+    static_configs:
+      # When Spark runs on the host, Docker can reach it via host.docker.internal
+      - targets: ["host.docker.internal:4040"]
+
+  # Kafka UI - simple HTTP check (if it exposes /metrics)
+  - job_name: "kafka-ui"
+    metrics_path: /
+    static_configs:
+      - targets: ["host.docker.internal:8080"]
